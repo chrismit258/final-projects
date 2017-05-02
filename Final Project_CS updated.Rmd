@@ -1,0 +1,330 @@
+---
+title: "Final Project"
+author: Christy Smith
+output:
+  html_document: default
+  html_notebook: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE, message=FALSE, warning=FALSE)
+```
+
+# Introduction 
+DNA methylation is an epigenetic mechanism used by cells to control gene expression. A methylated gene has a methyl group added to a CG dinucleotide of DNA, resulting in that gene being turned to the "off" position. Here we will use the Bioconductor workflow "methylationArrayAnalysis"" to analyze methylation data produced by the Illumina Infinium HumanMethylation450 array. This platform measures methylation at approximately 450,000 CpG sites and is the most common way to interrogate methylation across the human genome. Samples are treated with bisulfite conversion, which changes unmethylated cytosine to uracil. Then methylated cytosines can be distinguished from unmethylated cytosines by the base added downstream, either "G" for methylated CpG sites, or "A" for unmethylated sites. Each locus is detected in two colors (red and green), and methylation status is determined by comparing the two colors from the one position. For each CpG, there are two measurements: a methylated intensity (denoted by M) and an unmethylated intensity (denoted by U). These intensity values can be used to determine the proportion of methylation at each CpG locus. Methylation levels are commonly reported as beta values: (beta = M/(M+U)) or M-values (Mvalue*=*log2(M/U)). Each individual CpG probe can be tested for differential methylation for the comparisons of interest and p-values and moderated t-statistics can be generated for each CpG probe.
+
+We will be using a small, publicly available 450k methylation dataset (Zhang et al., Blood 2013; GEO accession number GSE49667). The dataset contains 10 samples in total: there are 4 different sorted T-cell types (naive, rTreg, act_naive, act_rTreg, collected from 3 different individuals (M28, M29, M30). 
+
+#Loading the data
+The data required for this workflow has been bundled with the R package that we will install first: 
+
+```{r}
+source("http://bioconductor.org/workflows.R")
+workflowInstall("methylationArrayAnalysis")
+```
+
+We need to set up a path to the data directory. 
+```{r}
+dataDirectory <- system.file("extdata", package = "methylationArrayAnalysis")
+list.files(dataDirectory, recursive = TRUE)
+```
+
+Next we will load all of the required packages for this analysis.
+
+```{r}
+library(limma)
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(IlluminaHumanMethylation450kmanifest)
+library(RColorBrewer)
+library(missMethyl)
+library(matrixStats)
+library(minfiData)
+library(Gviz)
+library(DMRcate)
+library(stringr)
+```
+
+The IlluminaHumanMethylation450kmanifest package provides the Illumina manifest as an R object which can easily be loaded into the environment. The manifest contains all of the annotation information for each of the CpG probes on the 450k array. This is useful for determining where any differentially methylated probes are located in a genomic context.
+
+```{r}
+ann450k = getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+head(ann450k)
+```
+
+Illumina methylation data is usually obtained in the form of Intensity Data (IDAT) Files. We will import the raw methylation data into R is using the minfi function read.metharray.sheet, along with the path to the IDAT files and a sample sheet. The sample sheet is a CSV (comma-separated) file containing one line per sample, with a number of columns describing each sample. This function will also create a column called Basename which specifies the location of each individual IDAT file in the experiment.
+
+```{r}
+targets <- read.metharray.sheet(dataDirectory, pattern="SampleSheet.csv")
+targets
+```
+
+Next we will read the raw intensity signals into R from the IDAT files using the read.metharray.exp function. This creates an RGChannelSet object that contains all the raw intensity data, from both the red and green color channels, for each of the samples.
+
+```{r}
+rgSet <- read.metharray.exp(targets=targets)
+rgSet
+```
+
+We will also rename the samples with more descriptive names.
+
+```{r}
+targets$ID <- paste(targets$Sample_Group,targets$Sample_Name,sep=".")
+sampleNames(rgSet) <- targets$ID
+rgSet
+```
+
+#Quality Control
+We can generate a detection p-value for every CpG in every sample, which is indicative of the quality of the signal. The method used by minfi to calculate detection p-values compares the total signal (M+U) for each probe to the background signal level, which is estimated from the negative control probes. Very small p-values are indicative of a reliable signal, while large p-values, for example >0.01, generally indicate a poor quality signal.
+
+```{r}
+detP <- detectionP(rgSet)
+head(detP)
+```
+
+Next we need to examine mean detection p-values across all samples to identify any failed samples, and plot the mean detection p-value for each sample.
+
+
+```{r}
+pal <- brewer.pal(8,"Dark2")
+par(mfrow=c(1,2))
+barplot(colMeans(detP), col=pal[factor(targets$Sample_Group)], las=2, 
+        cex.names=0.8, ylim=c(0,0.002), ylab="Mean detection p-values")
+abline(h=0.05,col="red")
+legend("topleft", legend=levels(factor(targets$Sample_Group)), fill=pal, 
+       bg="white")
+```
+
+This workflow introduced a birth sample from another study to demonstrate what a low quality sample would look like. We will use a detection p-value cutoff of >0.05, which removes the birth sample from further analysis.
+
+```{r}
+#remove poor quality samples from rgSet
+keep <- colMeans(detP) < 0.05
+rgSet <- rgSet[,keep]
+rgSet
+
+#remove poor quality samples from targets
+targets <- targets[keep,]
+targets[,1:5]
+
+#remove poor quality samples from detection p-values
+detP <- detP[,keep]
+dim(detP)
+```
+
+#Normalization
+The purpose of data normalization is to minimize the unwanted variation within and between samples. We will apply the preprocessQuantile method to our data. This function implements a stratified quantile normalisation procedure which is applied to the methylated and unmethylated signal intensities separately, and takes into account the different probe types. Note that after normalization, the data is housed in a GenomicRatioSet object. This is a much more compact representation of the data as the colour channel information has been discarded and the M and U intensity information has been converted to M-values and beta values, together with associated genomic coordinates. We can visualize what the data look like before and after normalization. 
+
+```{r}
+mSetSq <- preprocessQuantile(rgSet) 
+mSetRaw <- preprocessRaw(rgSet)
+par(mfrow=c(1,2))
+densityPlot(rgSet, sampGroups=targets$Sample_Group,main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(getBeta(mSetSq), sampGroups=targets$Sample_Group,
+            main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+
+#Data Exploration
+We will use multi-dimensional scaling (MDS) plots for visualising the data. MDS plots are based on principal components analysis and are an unsupervised method for looking at the similarities and differences between the various samples. Samples that are more similar to each other should cluster together, and samples that are very different should be further apart on the plot. In this dataset, the largest source of variation is between individuals. Therefore, the statistical model will have to account for individual to individual variation.
+
+```{r}
+par(mfrow=c(1,2))
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)])
+legend("top", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       bg="white", cex=0.7)
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common",  
+        col=pal[factor(targets$Sample_Source)])
+legend("top", legend=levels(factor(targets$Sample_Source)), text.col=pal,
+       bg="white", cex=0.7)
+
+# Examine higher dimensions to look at other sources of variation
+par(mfrow=c(1,3))
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], dim=c(1,3))
+legend("top", legend=levels(factor(targets$Sample_Group)), text.col=pal, 
+       cex=0.7, bg="white")
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], dim=c(2,3))
+legend("topleft", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.7, bg="white")
+
+plotMDS(getM(mSetSq), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], dim=c(3,4))
+legend("topright", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.7, bg="white")
+```
+
+#Filtering
+Next we will  filter out probes that have failed in one or more samples based on detection p-value.
+
+```{r}
+detP <- detP[match(featureNames(mSetSq),rownames(detP)),] 
+keep <- rowSums(detP < 0.01) == ncol(mSetSq) 
+table(keep)
+mSetSqFlt <- mSetSq[keep,]
+mSetSqFlt
+```
+We will also remove probes where common SNPs may affect the CpG. 
+
+```{r}
+mSetSqFlt <- dropLociWithSnps(mSetSqFlt)
+mSetSqFlt
+```
+
+We also need to filter out probes that have shown to be cross-reactive, that is, probes that have been demonstrated to map to multiple places in the genome. 
+
+```{r}
+xReactiveProbes <- read.csv(file=paste(dataDirectory,
+                                       "48639-non-specific-probes-Illumina450k.csv",
+                                       sep="/"), stringsAsFactors=FALSE)
+keep <- !(featureNames(mSetSqFlt) %in% xReactiveProbes$TargetID)
+table(keep)
+mSetSqFlt <- mSetSqFlt[keep,] 
+mSetSqFlt
+```
+
+Now that the data has been filtered and normalised, we will re-examine the MDS plots to see if the relationship between the samples has changed. It is apparent from the new MDS plots that much of the inter-individual variation has been removed as this is no longer the first principal component, likely due to the removal of the SNP-affected CpG probes. 
+
+```{r}
+par(mfrow=c(1,2))
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Group)], cex=0.8)
+legend("right", legend=levels(factor(targets$Sample_Group)), text.col=pal,
+       cex=0.65, bg="white")
+
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Source)])
+legend("right", legend=levels(factor(targets$Sample_Source)), text.col=pal,
+       cex=0.7, bg="white")
+
+# Examine higher dimensions to look at other sources of variation
+par(mfrow=c(1,3))
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Source)], dim=c(1,3))
+legend("right", legend=levels(factor(targets$Sample_Source)), text.col=pal,
+       cex=0.7, bg="white")
+
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Source)], dim=c(2,3))
+legend("topright", legend=levels(factor(targets$Sample_Source)), text.col=pal,
+       cex=0.7, bg="white")
+
+plotMDS(getM(mSetSqFlt), top=1000, gene.selection="common", 
+        col=pal[factor(targets$Sample_Source)], dim=c(3,4))
+legend("right", legend=levels(factor(targets$Sample_Source)), text.col=pal,
+       cex=0.7, bg="white")
+```
+
+The next step is to calculate M-values and beta values and compare their distributions on density plots.
+
+```{r}
+mVals <- getM(mSetSqFlt)
+head(mVals[,1:5])
+
+bVals <- getBeta(mSetSqFlt)
+head(bVals[,1:5])
+
+par(mfrow=c(1,2))
+densityPlot(bVals, sampGroups=targets$Sample_Group, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+densityPlot(mVals, sampGroups=targets$Sample_Group, main="M-values", 
+            legend=FALSE, xlab="M values")
+legend("topleft", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(8,"Dark2"))
+```
+
+We are interested in pairwise comparisons between the four cell types, taking into account individual to individual variation. We perform this analysis on the matrix of M-values in limma, obtaining moderated t-statistics and associated p-values for each CpG site. Since we are performing hundreds of thousands of hypothesis tests, we need to adjust the p-values for multiple testing. We will assign a false discovery rate of 5%. This will allow us to find significantly differentially methylated CpGs between cell types. 
+
+```{r}
+# this is the factor of interest
+cellType <- factor(targets$Sample_Group)
+# this is the individual effect that we need to account for
+individual <- factor(targets$Sample_Source) 
+
+# use the above to create a design matrix
+design <- model.matrix(~0+cellType+individual, data=targets)
+colnames(design) <- c(levels(cellType),levels(individual)[-1])
+ 
+# fit the linear model 
+fit <- lmFit(mVals, design)
+# create a contrast matrix for specific comparisons
+contMatrix <- makeContrasts(naive-rTreg,
+                           naive-act_naive,
+                           rTreg-act_rTreg,
+                           act_naive-act_rTreg,
+                           levels=design)
+contMatrix
+# fit the contrasts
+fit2 <- contrasts.fit(fit, contMatrix)
+fit2 <- eBayes(fit2)
+
+# look at the numbers of DM CpGs at FDR < 0.05
+summary(decideTests(fit2))
+```
+
+Next we will extract the tables of differentially expressed CpGs for each comparison, ordered by B-statistic by default, using the topTable function in limma. The results of the analysis for the first comparison, naive vs. rTreg, can be saved as a data.frame by setting coef=1. The coef parameter explicitly refers to the column in the contrasts matrix which corresponds to the comparison of interest. The resulting data.frame can easily be written to a CSV file.
+
+```{r}
+ann450kSub <- ann450k[match(rownames(mVals),ann450k$Name),
+                      c(1:4,12:19,24:ncol(ann450k))]
+DMPs <- topTable(fit2, num=Inf, coef=1, genelist=ann450kSub)
+head(DMPs)
+write.table(DMPs, file="DMPs.csv", sep=",", row.names=FALSE)
+```
+
+Next we will plot sample-wise methylation levels for the top differentially methylated CpG site using the plotCpg function in minfi, which is a convenient way to plot the sample-wise beta values stratified by the grouping variable.
+
+```{r}
+par(mfrow=c(2,2))
+sapply(rownames(DMPs)[1:4], function(cpg){
+  plotCpg(bVals, cpg=cpg, pheno=targets$Sample_Group, ylab = "Beta values")
+})
+```
+
+#Differential methylation analysis of regions
+We are interested in knowing whether several proximal CpGs are concordantly differentially methylated, that is, we want to identify differentially methylated regions. First, our matrix of M-values must be annotated with the relevant information about the probes such as their genomic position, gene annotation, etc. The limma pipeline is then used for differential methylation analysis to calculate moderated t-statistics.
+
+```{r}
+myAnnotation <- cpg.annotate(object = mVals, datatype = "array", what = "M", 
+                             analysis.type = "differential", design = design, 
+                             contrasts = TRUE, cont.matrix = contMatrix, 
+                             coef = "naive - rTreg", arraytype = "450K")
+str(myAnnotation)
+```
+
+Next we will use the dmrcate function to combine them to identify differentially methylated regions. The main output table DMRs$results contains all of the regions found, along with their genomic annotations and p-values.
+
+```{r}
+DMRs <- dmrcate(myAnnotation, lambda=1000, C=2)
+head(DMRs$results)
+```
+
+The regions can easily be viewed using the DMR.plot function provided in the DMRcate package. The DMRcate "DMR.plot" function allows you to quickly visualise DMRs in their genomic context. By default, the plot shows the location of the DMR in the genome, the position of any genes that are nearby, the base pair positions of the CpG probes, the methylation levels of the individual samples as a heatmap and the mean methylation levels for the various sample groups in the experiment. This plot shows the top ranked DMR identified by the DMRcate analysis.
+
+```{r}
+# convert the regions to annotated genomic ranges
+data(dmrcatedata)
+results.ranges <- extractRanges(DMRs, genome = "hg19")
+
+# set up the grouping variables and colors
+groups <- pal[1:length(unique(targets$Sample_Group))]
+names(groups) <- levels(factor(targets$Sample_Group))
+cols <- groups[as.character(factor(targets$Sample_Group))]
+samps <- 1:nrow(targets)
+
+# draw the plot for the top DMR
+par(mfrow=c(1,1))
+DMR.plot(ranges=results.ranges, dmr=1, CpGs=bVals, phen.col=cols, what = "Beta",
+         arraytype = "450K", pch=16, toscale=TRUE, plotmedians=TRUE, 
+         genome="hg19", samps=samps)
+```
